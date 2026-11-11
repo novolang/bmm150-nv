@@ -1,0 +1,48 @@
+// device_read — a reading loop for a BMM150 on a breakout, for an nRF52840 DK
+// or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins and its CSB and SDO
+// pins to ground, which puts the part at 0x10; its PS pin goes to the supply,
+// which selects I2C; DRDY goes to a free GPIO, if the program is to read the
+// data-ready line.  The program brings the part up (the driver waits the 3 ms
+// start-up by polling the chip id), at the regular preset and 10 Hz, and prints
+// one line per sample over RTT:
+//
+//     bmm150 x=<nanotesla> y=<nanotesla> z=<nanotesla>
+//
+// The Earth's field is between 25 000 and 65 000 nanotesla.  An axis the
+// compensation cannot compute reads -32768000.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_mag.{ MagNanoT, Magnetometer }
+use bmm150
+use bmm150.{ Bmm150 }
+
+// The part's address with CSB and SDO low.
+const ADDR = 0x10
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw, mutate]
+    let part = Bmm150.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    if not part.begin()
+        hal.uart.write("bmm150: no answer\n")
+        return
+    loop
+        match part.mag_read_new()
+            Some(m) =>
+                hal.uart.write("bmm150")
+                field(" x=", m.x)
+                field(" y=", m.y)
+                field(" z=", m.z)
+                hal.uart.write("\n")
+            None    =>
+                hal.timer.delay_ms(5)

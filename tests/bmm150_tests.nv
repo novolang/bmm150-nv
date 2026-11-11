@@ -1,0 +1,1569 @@
+// bmm150_tests — the driver over a double of the part: a register file that
+// answers on an I2C bus and on an SPI bus the way Bosch Sensortec's data sheet
+// (BST-BMM150-DS001-05, revision 1.4, §§ 4.2, 5 and 6) says a BMM150 does, so
+// the suspend mode in which only the power control bit answers, the 3 ms
+// start-up, the data registers and their ready flag, the forced mode that ends
+// by itself, the self-test and the bring-up are checked on the host, one
+// transaction at a time.  The log keeps what the controller sent, in a form
+// the tests compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the register, the count, -1; an SPI transaction is
+// 3, the bytes the controller clocked out, -1.  The writes that reach a
+// register are also kept apart, as the register and the byte, so a bring-up
+// is compared without the reads between its writes.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, TimerAsync, AsyncEdge }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_mag.{ MagNanoT, Magnetometer }
+use dev_id.{ DeviceId, Identifiable }
+use bmm150
+use bmm150.{ Bmm150, Bmm150Spi, BmmMode, BmmPreset, Bmm150Port, Bmm150Trim }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers.  `st` is the double's state:
+// 0 is 0 before an SPI command byte and 1 after it, 1 the register, 2 RW,
+// 4 1 when a part is there, 5 1 when the part heard the SPI transaction, 9 1
+// inside an SPI transaction, 20 and 21 the SPI clock and mode, 22 the I2C
+// clock, 40 the reads that answer 0 whatever the register, left of the
+// start-up time, 41 how many reads the start-up takes each time the power
+// control bit is set, 42 the self-clearing bits of POWER pending, 43 the reads of
+// POWER left before they clear, 44 how many reads that is (-1 for never), 50
+// the reads of RHALL's LSB a forced measurement takes, 52 1 while a forced
+// measurement runs, 60 the reads of OPMODE a self-test takes (-1 for never),
+// 61 the axes that pass it as a mask, 62 the reads left, 63 1 while it runs,
+// 53 the reads of RHALL's LSB that answer without DRDY,
+// 70 the transactions the part answers before it goes silent (0 for no
+// limit), 71 the transactions used, 80 the writes kept and 99 the entries in
+// the log.  `ro` lists registers that ignore a write.  `log` is the log and
+// `wl` the writes.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    wl: HashMap<Int, Int>
+
+@tier(app)
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The trim registers of the part, as the data sheet's registers hold the
+// factory values the tests use: DIG_X1 3, DIG_Y1 -2, DIG_Z4 -100, DIG_X2 5,
+// DIG_Y2 -9, DIG_Z2 5840, DIG_Z1 32000, DIG_XYZ1 7500, DIG_Z3 -200, DIG_XY2 -3
+// and DIG_XY1 40.
+@tier(app)
+fn trim_regs(c: Chip)
+    c.regs.insert(0x5D, 3)
+    c.regs.insert(0x5E, 0xFE)
+    c.regs.insert(0x62, 0x9C)
+    c.regs.insert(0x63, 0xFF)
+    c.regs.insert(0x64, 5)
+    c.regs.insert(0x65, 0xF7)
+    c.regs.insert(0x68, 0xD0)
+    c.regs.insert(0x69, 0x16)
+    c.regs.insert(0x6A, 0x00)
+    c.regs.insert(0x6B, 0x7D)
+    c.regs.insert(0x6C, 0x4C)
+    c.regs.insert(0x6D, 0x1D)
+    c.regs.insert(0x6E, 0x38)
+    c.regs.insert(0x6F, 0xFF)
+    c.regs.insert(0x70, 0xFD)
+    c.regs.insert(0x71, 40)
+
+// The registers as the part holds them after a reset: sleep mode, the
+// interrupt enables off, the pins at their defaults.
+@tier(app)
+fn chip_defaults(c: Chip)
+    c.regs.insert(0x4C, 0x06)
+    c.regs.insert(0x4D, 0x3F)
+    c.regs.insert(0x4E, 0x07)
+    c.regs.insert(0x4F, 0)
+    c.regs.insert(0x50, 0)
+    c.regs.insert(0x51, 0)
+    c.regs.insert(0x52, 0)
+
+// The chip in suspend mode, as after power-on: CHIP_ID in place, the trim data
+// in place, the power control bit clear.  The module's trim data is forgotten.
+@tier(app)
+fn chip() -> Chip [mutate]
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        wl: HashMap.new() }
+    c.regs.insert(0x40, 0x32)
+    trim_regs(c)
+    chip_defaults(c)
+    c.st.insert(4, 1)
+    bmm150.trim_clear()
+    c
+
+// The chip with the power control bit set: in sleep mode, readable.
+@tier(app)
+fn chip_on() -> Chip [mutate]
+    let c = chip()
+    c.regs.insert(0x4B, 0x01)
+    c
+
+// Appends a value to the log.
+@tier(app)
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+@tier(app)
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// Whether the part answers this transaction: it is there, and it has not used
+// the transactions it was allowed.
+@tier(app)
+fn present(c: Chip) -> Bool
+    if at(c.st, 4) == 0
+        return false
+    let lim = at(c.st, 70)
+    if lim == 0
+        return true
+    let used = at(c.st, 71) + 1
+    c.st.insert(71, used)
+    used <= lim
+
+// Whether the power control bit is set.
+@tier(app)
+fn powered(c: Chip) -> Bool
+    (at(c.regs, 0x4B) & 1) != 0
+
+// A register as the part answers it.  In suspend mode only POWER answers and
+// everything else reads 0.  CHIP_ID reads 0 for the start-up time.  POWER
+// shows its self-clearing bits for as many reads as the test set.  OPMODE
+// shows a running self-test the same way, and the self-test leaves its result
+// in bit 0 of the X, Y and Z LSB registers.  RHALL's LSB counts down a forced
+// measurement, which ends by putting the opmode back to sleep and setting
+// DRDY.  A read of a data register clears DRDY after it.
+@tier(app)
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg != 0x4B and not powered(c)
+        return 0
+    if reg != 0x4B and at(c.st, 40) > 0
+        c.st.insert(40, at(c.st, 40) - 1)
+        return 0
+    if reg == 0x4B and at(c.st, 42) != 0
+        if at(c.st, 43) > 0
+            c.st.insert(43, at(c.st, 43) - 1)
+            return at(c.regs, 0x4B) | at(c.st, 42)
+        c.st.insert(42, 0)
+    if reg == 0x4C and at(c.st, 63) == 1
+        if at(c.st, 62) != 0
+            if at(c.st, 62) > 0
+                c.st.insert(62, at(c.st, 62) - 1)
+            return at(c.regs, 0x4C) | 1
+        c.st.insert(63, 0)
+        let m = at(c.st, 61)
+        c.regs.insert(0x42, at(c.regs, 0x42) | (m & 1))
+        c.regs.insert(0x44, at(c.regs, 0x44) | ((m >> 1) & 1))
+        c.regs.insert(0x46, at(c.regs, 0x46) | ((m >> 2) & 1))
+    if reg == 0x48 and at(c.st, 53) > 0
+        c.st.insert(53, at(c.st, 53) - 1)
+        return at(c.regs, 0x48) & 0xFE
+    if reg == 0x48 and at(c.st, 52) == 1
+        if at(c.st, 50) > 0
+            c.st.insert(50, at(c.st, 50) - 1)
+        else
+            c.st.insert(52, 0)
+            c.regs.insert(0x4C, at(c.regs, 0x4C) | 0x06)
+            c.regs.insert(0x48, at(c.regs, 0x48) | 1)
+    let v = at(c.regs, reg)
+    if reg >= 0x42 and reg <= 0x49
+        c.regs.insert(0x48, at(c.regs, 0x48) & 0xFE)
+    v
+
+// A write to a register, which a read-only one ignores.  In suspend mode only
+// POWER takes a write.  POWER's two reset bits, with the power control bit set,
+// restore the registers and clear themselves after the reads the test set;
+// without the power control bit they do nothing; clearing the power control bit
+// is suspend, which restores the registers.  OPMODE written to forced mode
+// starts a measurement that ends by itself, after the reads the test set,
+// which may be none; written to sleep with the self-test bit set it starts the
+// self-test.
+@tier(app)
+fn chip_write(c: Chip, reg: Int, v: Int)
+    let n = at(c.st, 80)
+    c.wl.insert(n * 2, reg)
+    c.wl.insert(n * 2 + 1, v & 0xFF)
+    c.st.insert(80, n + 1)
+    if at(c.ro, reg) == 1
+        return
+    if reg == 0x4B
+        let on = (v & 1) != 0
+        if on and not powered(c)
+            c.st.insert(40, at(c.st, 41))
+        c.regs.insert(0x4B, v & 0x05)
+        if not on
+            chip_defaults(c)
+        if on and (v & 0x82) == 0x82
+            chip_defaults(c)
+            c.st.insert(42, v & 0x82)
+            var reads = at(c.st, 44)
+            if reads < 0
+                reads = 1000000
+            c.st.insert(43, reads)
+        return
+    if not powered(c)
+        return
+    if reg == 0x4C
+        if (v & 0x06) == 0x02
+            if at(c.st, 50) == 0
+                c.regs.insert(0x4C, v | 0x06)
+                c.regs.insert(0x48, at(c.regs, 0x48) | 1)
+            else
+                c.regs.insert(0x4C, v)
+                c.st.insert(52, 1)
+            return
+        if (v & 1) != 0 and (v & 0x06) == 0x06
+            var reads = at(c.st, 60)
+            if reads < 0
+                reads = -1
+            c.st.insert(62, reads)
+            c.st.insert(63, 1)
+            c.regs.insert(0x4C, v & 0xFE)
+            return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    @tier(app)
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != 0x10 or not present(self.c) or data.len() < 2
+            return false
+        var r = data[0] as Int & 0x7F
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            r = r + 1
+        true
+
+    @tier(app)
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != 0x10 or not present(self.c)
+            return None
+        var r = tx[0] as Int & 0x7F
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, chip_read(self.c, r) as u8)
+            r = r + 1
+        Some(out)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    @tier(app)
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    @tier(app)
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x7F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            var heard = 0
+            if present(self.c)
+                heard = 1
+            self.c.st.insert(5, heard)
+            return 0xFF
+        if at(self.c.st, 5) == 0
+            return 0xFF
+        let r = at(self.c.st, 1)
+        self.c.st.insert(1, (r + 1) & 0x7F)
+        if at(self.c.st, 2) == 1
+            return chip_read(self.c, r)
+        chip_write(self.c, r, b)
+        0xFF
+
+    @tier(app)
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    @tier(app)
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI transaction
+// and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    @tier(app)
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    @tier(app)
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    @tier(app)
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// The two ports, as a type that holds a bus implements them: every method is
+// the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Bmm150Port for I2cDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        bmm150.i2c_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bmm150.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        bmm150.i2c_write(self.bus, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        bmm150.irq_level_of(self.pins, self.w)
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Bmm150Port for SpiDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        bmm150.spi_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bmm150.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        bmm150.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        bmm150.irq_level_of(self.pins, self.w)
+
+// The board's wiring: the part at 0x10 on I2C, DRDY on pin 65.
+@tier(app)
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x10), 65)
+
+// The part on SPI: chip select on pin 67, DRDY on pin 65.
+@tier(app)
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
+
+@tier(app)
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+@tier(app)
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+@tier(app)
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// The number of transactions in the log.
+@tier(app)
+fn transactions(c: Chip) -> Int
+    var n = 0
+    for i in 0..at(c.st, 99)
+        if at(c.log, i) == -1
+            n = n + 1
+    n
+
+// Asserts the writes that reached the part are `want`, as register and byte
+// pairs, then forgets them.
+@tier(app)
+fn writes_are(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 80) * 2, want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.wl, i), want[i])
+    c.st.insert(80, 0)
+
+@tier(app)
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Sets the 16-bit word of a data register pair, low byte first, at `reg`.
+@tier(app)
+fn put16(c: Chip, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    c.regs.insert(reg, u & 0xFF)
+    c.regs.insert(reg + 1, u >> 8)
+
+// Sets the data registers to raw values: X and Y 13 bits in bits 15 to 3, Z 15
+// bits in bits 15 to 1, RHALL 14 bits in bits 15 to 2 with DRDY in bit 0.
+@tier(app)
+fn put_raw(c: Chip, x: Int, y: Int, z: Int, rhall: Int, drdy: Int)
+    put16(c, 0x42, x * 8)
+    put16(c, 0x44, y * 8)
+    put16(c, 0x46, z * 2)
+    put16(c, 0x48, rhall * 4 + drdy)
+
+@tier(app)
+fn x_of(o: ?MagNanoT) -> Int
+    match o
+        Some(m) => m.x
+        None    => -1
+
+@tier(app)
+fn y_of(o: ?MagNanoT) -> Int
+    match o
+        Some(m) => m.y
+        None    => -1
+
+@tier(app)
+fn z_of(o: ?MagNanoT) -> Int
+    match o
+        Some(m) => m.z
+        None    => -1
+
+@tier(app)
+fn is_none(o: ?MagNanoT) -> Bool
+    match o
+        Some(_) => false
+        None    => true
+
+// The log of an SPI read: the command, then `n` bytes of 0xFF, which is what
+// the controller clocks out while it reads.
+@tier(app)
+fn spi_read_log(cmd: Int, n: Int) -> [Int]
+    var out: [Int] = [3, cmd]
+    for _i in 0..n
+        list.push(out, 0xFF)
+    list.push(out, -1)
+    out
+
+// The trim data of the double, as the module reads it.
+@tier(app)
+fn trims() -> Bmm150Trim
+    Bmm150Trim { x1: 3,
+        y1: -2,
+        z4: -100,
+        x2: 5,
+        y2: -9,
+        z2: 5840,
+        z1: 32000,
+        xyz1: 7500,
+        z3: -200,
+        xy2: -3,
+        xy1: 40 }
+
+// ── The two buses' framing ───────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_of_one_register_sends_the_bare_register() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert_eq(bmm150.reg_read(d, 0x40) ?? -1, 0x32)
+    log_is(c, [2, 0x10, 0x40, 1, -1])
+
+@test
+fn test_an_i2c_read_of_a_run_has_no_increment_bit_because_the_address_advances_by_itself() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x42, 11)
+    c.regs.insert(0x43, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x42, 2, var b))
+    log_is(c, [2, 0x10, 0x42, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(d.write_reg(0x51, 0x04))
+    log_is(c, [1, 0x10, 0x51, 0x04, -1])
+    test.assert_eq(reg_of(c, 0x51), 4)
+
+@test
+fn test_an_update_changes_only_the_bits_of_its_mask() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x51, 0xAA)
+    test.assert(bmm150.reg_update(d, 0x51, 0x0F, 0xFF))
+    test.assert_eq(reg_of(c, 0x51), 0xAF)
+    test.assert(bmm150.reg_update(d, 0x51, 0xF0, 0x00))
+    test.assert_eq(reg_of(c, 0x51), 0x0F)
+    c.ro.insert(0x51, 1)
+    test.assert(not bmm150.reg_update(d, 0x51, 0xF0, 0xF0))
+    c.st.insert(4, 0)
+    test.assert(not bmm150.reg_update(d, 0x51, 0xF0, 0xF0))
+
+@test
+fn test_a_missing_i2c_part_does_not_answer() [io, hw, mutate]
+    let c = chip_on()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(bmm150.reg_read(d, 0x40) == None)
+    test.assert(not d.write_reg(0x51, 4))
+    test.assert(not bmm150.reg_write(d, 0x51, 4))
+    test.assert(bmm150.id_read(d) == None)
+
+@test
+fn test_an_spi_read_sets_rw_and_a_run_just_keeps_clocking() [io, hw, mutate]
+    let c = chip_on()
+    let d = spi_dut(c)
+    test.assert_eq(bmm150.reg_read(d, 0x40) ?? -1, 0x32)
+    log_is(c, [3, 0xC0, 0xFF, -1])
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    c.regs.insert(0x42, 11)
+    c.regs.insert(0x43, 22)
+    c.regs.insert(0x44, 33)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x42, 3, var b))
+    log_is(c, [3, 0xC2, 0xFF, 0xFF, 0xFF, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+    test.assert_eq(b[2] as Int, 33)
+
+@test
+fn test_an_spi_write_clears_rw() [io, hw, mutate]
+    let c = chip_on()
+    let d = spi_dut(c)
+    test.assert(d.write_reg(0x51, 0x04))
+    log_is(c, [3, 0x51, 0x04, -1])
+    test.assert_eq(reg_of(c, 0x51), 4)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw, mutate]
+    let c = chip_on()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert_eq(bmm150.reg_read(d, 0x40) ?? -1, 0xFF)
+    test.assert(bmm150.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw, mutate]
+    let c = chip_on()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: w }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x40, 1, var b))
+    test.assert(not d.write_reg(0x51, 1))
+    test.assert(not d.setup())
+    log_is(c, [])
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw, mutate]
+    let c = chip_on()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: w }
+    test.assert(not d.setup())
+
+@test
+fn test_i2c_setup_makes_the_ready_pin_an_input_and_the_bus_fast() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 22), 400000)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw, mutate]
+    let c = chip_on()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+    log_is(c, [])
+
+@test
+fn test_the_ready_line_level() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert_eq(d.irq_level(), 0)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    let bare = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x10) }
+    test.assert_eq(bare.irq_level(), -1)
+    test.assert_eq(spi_dut(c).irq_level(), 0)
+
+@test
+fn test_the_identity_is_the_chip_id_and_only_a_powered_part_has_one() [io, hw, mutate]
+    let c = chip()
+    let d = i2c_dut(c)
+    // In suspend mode CHIP_ID reads 0 on I2C: no part.
+    test.assert(bmm150.id_read(d) == None)
+    c.regs.insert(0x4B, 1)
+    let id = bmm150.id_read(d) ?? DeviceId { who: -1, rev: None }
+    test.assert_eq(id.who, 0x32)
+    test.assert(id.rev == None)
+    test.assert_eq((bmm150.id_read(spi_dut(c)) ?? DeviceId { who: -1, rev: None }).who, 0x32)
+
+// ── The compensation ─────────────────────────────────────────────────
+//
+// A vector derived by hand from the data sheet's formula as the SensorAPI
+// writes it in integers (`compensate_x`, `compensate_y`, `compensate_z`), with
+// the trim data of `trims()` and the resistance RHALL = 8000.  Division
+// truncates toward zero, as C's does.
+//
+//   X, raw 100, DIG_X1 3, DIG_X2 5:
+//     1. 7500 * 16384 / 8000                 = 15360
+//     2. 15360 - 0x4000                      = -1024   (the 16-bit wrap changes nothing)
+//     3. DIG_XY2 * (r * r / 128)             = -3 * (1048576 / 128) = -3 * 8192 = -24576
+//     4. r * (DIG_XY1 * 128)                 = -1024 * 5120 = -5242880
+//     5. (-24576 - 5242880) / 512            = -5267456 / 512 = -10288
+//     6. (-10288 + 0x100000) * (5 + 0xA0) / 4096
+//                                            = 1038288 * 165 / 4096 = 171317520 / 4096 = 41825
+//     7. 100 * 41825 / 8192                  = 4182500 / 8192 = 510
+//     8. 510 + DIG_X1 * 8                    = 510 + 24 = 534   (1/16 microtesla)
+//     9. 534 * 1000 / 16                     = 33375 nanotesla
+//   Y, raw -60, DIG_Y1 -2, DIG_Y2 -9: steps 1 to 5 are the same;
+//     6. 1038288 * (-9 + 160) / 4096         = 156781488 / 4096 = 38276
+//     7. -60 * 38276 / 8192                  = -2296560 / 8192 = -280
+//     8. -280 + (-2) * 8                     = -296
+//     9. -296 * 125 / 2                      = -18500 nanotesla
+//   Z, raw 200, DIG_Z1 32000, DIG_Z2 5840, DIG_Z3 -200, DIG_Z4 -100:
+//     1. DIG_Z3 * (8000 - 7500) / 4          = -200 * 500 / 4 = -25000
+//     2. (200 - (-100)) * 32768              = 9830400
+//     3. DIG_Z1 * (8000 * 2)                 = 512000000
+//     4. (512000000 + 32768) / 65536         = 7813
+//     5. (9830400 - (-25000)) / (5840 + 7813) = 9855400 / 13653 = 721
+//     6. 721 * 125 / 2                       = 45062 nanotesla
+
+@test
+fn test_x_is_compensated_as_the_data_sheet_s_formula_gives() [io, hw, mutate]
+    test.assert_eq(bmm150.comp_xy(7500, 40, -3, 3, 5, 100, 8000), 33375)
+
+@test
+fn test_y_is_compensated_with_its_own_trim_data() [io, hw, mutate]
+    test.assert_eq(bmm150.comp_xy(7500, 40, -3, -2, -9, -60, 8000), -18500)
+
+@test
+fn test_z_is_compensated_as_the_data_sheet_s_formula_gives() [io, hw, mutate]
+    test.assert_eq(bmm150.comp_z(32000, 5840, -200, -100, 7500, 200, 8000), 45062)
+
+@test
+fn test_the_three_axes_together() [io, hw, mutate]
+    let m = bmm150.compensate(trims(), 100, -60, 200, 8000)
+    test.assert_eq(m.x, 33375)
+    test.assert_eq(m.y, -18500)
+    test.assert_eq(m.z, 45062)
+
+@test
+fn test_with_the_resistance_equal_to_dig_xyz1_the_correction_vanishes() [io, hw, mutate]
+    // r = 0: step 6 is 0x100000 * (DIG_X2 + 160) / 4096 = 256 * 165 = 42240,
+    // and 100 * 42240 / 8192 = 515, plus 24 = 539, times 125 / 2 = 33687.
+    test.assert_eq(bmm150.comp_xy(7500, 40, -3, 3, 5, 100, 7500), 33687)
+
+@test
+fn test_a_zero_resistance_falls_back_to_dig_xyz1_for_x_and_y_only() [io, hw, mutate]
+    test.assert_eq(bmm150.comp_xy(7500, 40, -3, 3, 5, 100, 0), 33687)
+    test.assert(bmm150.is_overflow(bmm150.comp_xy(0, 40, -3, 3, 5, 100, 0)))
+    test.assert(bmm150.is_overflow(bmm150.comp_z(32000, 5840, -200, -100, 7500, 200, 0)))
+
+@test
+fn test_the_adc_overflow_markers_give_the_sentinel() [io, hw, mutate]
+    test.assert_eq(bmm150.comp_xy(7500, 40, -3, 3, 5, -4096, 8000), -32768000)
+    test.assert(bmm150.is_overflow(bmm150.comp_xy(7500, 40, -3, 3, 5, -4096, 8000)))
+    test.assert(bmm150.is_overflow(bmm150.comp_z(32000, 5840, -200, -100, 7500, -16384, 8000)))
+    test.assert(not bmm150.is_overflow(33375))
+    test.assert(not bmm150.is_overflow(bmm150.comp_xy(7500, 40, -3, 3, 5, -4095, 8000)))
+
+@test
+fn test_z_with_a_zero_in_the_trim_data_or_a_zero_divisor_gives_the_sentinel() [io, hw, mutate]
+    test.assert(bmm150.is_overflow(bmm150.comp_z(32000, 0, -200, -100, 7500, 200, 8000)))
+    test.assert(bmm150.is_overflow(bmm150.comp_z(0, 5840, -200, -100, 7500, 200, 8000)))
+    test.assert(bmm150.is_overflow(bmm150.comp_z(32000, 5840, -200, -100, 0, 200, 8000)))
+    // DIG_Z2 + 7813 = 0: the SensorAPI would divide by zero.
+    test.assert(bmm150.is_overflow(bmm150.comp_z(32000, -7813, -200, -100, 7500, 200, 8000)))
+
+@test
+fn test_z_is_held_to_the_range_the_sensor_api_holds_it_to() [io, hw, mutate]
+    // The quotient before the division by 16 is held to ±32767, which is
+    // 2 047 937 nanotesla.
+    test.assert_eq(bmm150.comp_z(32000, 5840, -200, -100, 7500, 16000, 8000), 2047937)
+    test.assert_eq(bmm150.comp_z(32000, 5840, -200, -100, 7500, -16000, 8000), -2047937)
+
+// ── The trim data ────────────────────────────────────────────────────
+
+@test
+fn test_the_trim_data_is_read_in_the_sensor_api_s_three_reads() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(not bmm150.trim_ready())
+    test.assert(bmm150.trim_load(d))
+    log_is(c, [2, 0x10, 0x5D, 2, -1, 2, 0x10, 0x62, 4, -1, 2, 0x10, 0x68, 10, -1])
+    test.assert(bmm150.trim_ready())
+    let t = bmm150.trim_get()
+    test.assert_eq(t.x1, 3)
+    test.assert_eq(t.y1, -2)
+    test.assert_eq(t.z4, -100)
+    test.assert_eq(t.x2, 5)
+    test.assert_eq(t.y2, -9)
+    test.assert_eq(t.z2, 5840)
+    test.assert_eq(t.z1, 32000)
+    test.assert_eq(t.xyz1, 7500)
+    test.assert_eq(t.z3, -200)
+    test.assert_eq(t.xy2, -3)
+    test.assert_eq(t.xy1, 40)
+
+@test
+fn test_each_trim_value_has_its_own_width_and_sign() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    // DIG_Z1 and DIG_XY1 are unsigned, DIG_XYZ1 is 15 bits, the others are
+    // signed.
+    c.regs.insert(0x6A, 0xFF)
+    c.regs.insert(0x6B, 0xFF)
+    c.regs.insert(0x6C, 0xFF)
+    c.regs.insert(0x6D, 0xFF)
+    c.regs.insert(0x71, 0xFF)
+    c.regs.insert(0x70, 0x80)
+    c.regs.insert(0x5D, 0x80)
+    c.regs.insert(0x69, 0x80)
+    c.regs.insert(0x68, 0x00)
+    test.assert(bmm150.trim_load(d))
+    let t = bmm150.trim_get()
+    test.assert_eq(t.z1, 65535)
+    test.assert_eq(t.xyz1, 32767)
+    test.assert_eq(t.xy1, 255)
+    test.assert_eq(t.xy2, -128)
+    test.assert_eq(t.x1, -128)
+    test.assert_eq(t.z2, -32768)
+
+@test
+fn test_a_part_that_stops_answering_leaves_no_trim_data() [io, hw, mutate]
+    let c = chip_on()
+    c.st.insert(4, 0)
+    test.assert(not bmm150.trim_load(i2c_dut(c)))
+    // The first read answered, the second not.
+    let c2 = chip_on()
+    c2.st.insert(70, 1)
+    test.assert(not bmm150.trim_load(i2c_dut(c2)))
+    // The first two answered, the third not.
+    let c3 = chip_on()
+    c3.st.insert(70, 2)
+    test.assert(not bmm150.trim_load(i2c_dut(c3)))
+    test.assert(not bmm150.trim_ready())
+
+@test
+fn test_the_trim_data_is_zero_until_it_is_loaded_and_clear_forgets_it() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert_eq(bmm150.trim_get().xyz1, 0)
+    test.assert(bmm150.trim_load(d))
+    test.assert_eq(bmm150.trim_get().xyz1, 7500)
+    bmm150.trim_clear()
+    test.assert(not bmm150.trim_ready())
+    test.assert_eq(bmm150.trim_get().z1, 0)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_loads_the_trim_data_once_then_is_one_burst_of_eight_registers() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    put_raw(c, 100, -60, 200, 8000, 1)
+    let a = bmm150.sample_read(d)
+    log_is(c, [2, 0x10, 0x5D, 2, -1, 2, 0x10, 0x62, 4, -1, 2, 0x10, 0x68, 10, -1, 2, 0x10, 0x42, 8, -1])
+    test.assert_eq(x_of(a), 33375)
+    test.assert_eq(y_of(a), -18500)
+    test.assert_eq(z_of(a), 45062)
+    let b = bmm150.sample_read(d)
+    log_is(c, [2, 0x10, 0x42, 8, -1])
+    test.assert_eq(x_of(b), 33375)
+
+@test
+fn test_the_raw_words_are_decoded_at_their_widths() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(bmm150.trim_load(d))
+    // X and Y are 13 bits in bits 15 to 3, Z is 15 bits in bits 15 to 1,
+    // RHALL is 14 bits in bits 15 to 2 (§ 4.3.1).
+    put_raw(c, 100, -60, 200, 8000, 1)
+    test.assert_eq(reg_of(c, 0x42), 0x20)
+    test.assert_eq(reg_of(c, 0x43), 0x03)
+    test.assert_eq(reg_of(c, 0x44), 0x20)
+    test.assert_eq(reg_of(c, 0x45), 0xFE)
+    test.assert_eq(reg_of(c, 0x46), 0x90)
+    test.assert_eq(reg_of(c, 0x47), 0x01)
+    test.assert_eq(reg_of(c, 0x48), 0x01)
+    test.assert_eq(reg_of(c, 0x49), 0x7D)
+    test.assert_eq(z_of(bmm150.sample_read(d)), 45062)
+    // The self-test and DRDY bits in bit 0 of the LSB registers do not enter
+    // the values.
+    c.regs.insert(0x42, 0x21)
+    c.regs.insert(0x44, 0x21)
+    c.regs.insert(0x48, 0x00)
+    test.assert_eq(x_of(bmm150.sample_read(d)), 33375)
+    test.assert_eq(y_of(bmm150.sample_read(d)), -18500)
+
+@test
+fn test_an_overflowing_axis_carries_the_sentinel_and_the_others_do_not() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    put_raw(c, -4096, -60, -16384, 8000, 1)
+    let a = bmm150.sample_read(d)
+    test.assert(bmm150.is_overflow(x_of(a)))
+    test.assert_eq(y_of(a), -18500)
+    test.assert(bmm150.is_overflow(z_of(a)))
+
+@test
+fn test_a_sample_over_spi_is_the_same_burst() [io, hw, mutate]
+    let c = chip_on()
+    let d = spi_dut(c)
+    put_raw(c, 100, -60, 200, 8000, 1)
+    let a = bmm150.sample_read(d)
+    test.assert_eq(x_of(a), 33375)
+    test.assert_eq(z_of(a), 45062)
+    log_clear(c)
+    let _ = bmm150.sample_read(d)
+    log_is(c, spi_read_log(0xC2, 8))
+
+@test
+fn test_no_part_gives_no_sample_and_is_never_ready() [io, hw, mutate]
+    let c = chip_on()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(is_none(bmm150.sample_read(d)))
+    test.assert(not bmm150.sample_ready(d))
+    // A part that answers the trim reads and then goes silent.
+    let c2 = chip_on()
+    c2.st.insert(70, 3)
+    test.assert(is_none(bmm150.sample_read(i2c_dut(c2))))
+
+@test
+fn test_ready_is_the_drdy_flag_and_reading_it_clears_it() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(not bmm150.sample_ready(d))
+    put_raw(c, 0, 0, 0, 8000, 1)
+    test.assert(bmm150.sample_ready(d))
+    test.assert(not bmm150.sample_ready(d))
+    // A burst of the data registers clears it too.
+    put_raw(c, 0, 0, 0, 8000, 1)
+    test.assert(bmm150.trim_load(d))
+    let _ = bmm150.sample_read(d)
+    test.assert(not bmm150.sample_ready(d))
+
+// ── Mode and rate ────────────────────────────────────────────────────
+
+@test
+fn test_the_mode_follows_the_opmode_field() [io, hw, mutate]
+    test.assert(bmm150.mode_of_opmode(0x00) == BmmMode.BmmNormal)
+    test.assert(bmm150.mode_of_opmode(0x38) == BmmMode.BmmNormal)
+    test.assert(bmm150.mode_of_opmode(0x02) == BmmMode.BmmForced)
+    test.assert(bmm150.mode_of_opmode(0x06) == BmmMode.BmmSleep)
+    test.assert(bmm150.mode_of_opmode(0x04) == BmmMode.BmmSleep)
+    test.assert_eq(bmm150.mode_bits(BmmMode.BmmNormal), 0)
+    test.assert_eq(bmm150.mode_bits(BmmMode.BmmForced), 1)
+    test.assert_eq(bmm150.mode_bits(BmmMode.BmmSleep), 3)
+
+@test
+fn test_the_mode_is_written_leaving_the_rate() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4C, 0x2E)
+    test.assert(bmm150.mode_write(d, BmmMode.BmmNormal))
+    test.assert_eq(reg_of(c, 0x4C), 0x28)
+    test.assert(bmm150.mode_read(d) == BmmMode.BmmNormal)
+    test.assert(bmm150.mode_write(d, BmmMode.BmmSleep))
+    test.assert_eq(reg_of(c, 0x4C), 0x2E)
+    test.assert(bmm150.mode_read(d) == BmmMode.BmmSleep)
+    c.st.insert(4, 0)
+    test.assert(not bmm150.mode_write(d, BmmMode.BmmNormal))
+    test.assert(bmm150.mode_read(d) == BmmMode.BmmSleep)
+
+@test
+fn test_forced_mode_is_written_without_a_read_back_because_it_ends_by_itself() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4C, 0x2E)
+    // The measurement is over before anything can read the field back.
+    test.assert(bmm150.mode_write(d, BmmMode.BmmForced))
+    writes_are(c, [0x4C, 0x2A])
+    test.assert_eq(reg_of(c, 0x4C), 0x2E)
+    c.st.insert(4, 0)
+    test.assert(not bmm150.forced_start(d))
+    c.st.insert(4, 1)
+    c.st.insert(70, 1)
+    test.assert(not bmm150.forced_start(d))
+
+@test
+fn test_the_rate_codes() [io, hw, mutate]
+    test.assert_eq(bmm150.rate_hz_of_code(0), 10)
+    test.assert_eq(bmm150.rate_hz_of_code(1), 2)
+    test.assert_eq(bmm150.rate_hz_of_code(2), 6)
+    test.assert_eq(bmm150.rate_hz_of_code(3), 8)
+    test.assert_eq(bmm150.rate_hz_of_code(4), 15)
+    test.assert_eq(bmm150.rate_hz_of_code(5), 20)
+    test.assert_eq(bmm150.rate_hz_of_code(6), 25)
+    test.assert_eq(bmm150.rate_hz_of_code(7), 30)
+    test.assert_eq(bmm150.rate_hz_of_code(15), 30)
+
+@test
+fn test_a_requested_rate_rounds_up() [io, hw, mutate]
+    test.assert_eq(bmm150.code_for_rate(0), 1)
+    test.assert_eq(bmm150.code_for_rate(2), 1)
+    test.assert_eq(bmm150.code_for_rate(3), 2)
+    test.assert_eq(bmm150.code_for_rate(6), 2)
+    test.assert_eq(bmm150.code_for_rate(7), 3)
+    test.assert_eq(bmm150.code_for_rate(8), 3)
+    test.assert_eq(bmm150.code_for_rate(9), 0)
+    test.assert_eq(bmm150.code_for_rate(10), 0)
+    test.assert_eq(bmm150.code_for_rate(11), 4)
+    test.assert_eq(bmm150.code_for_rate(15), 4)
+    test.assert_eq(bmm150.code_for_rate(16), 5)
+    test.assert_eq(bmm150.code_for_rate(20), 5)
+    test.assert_eq(bmm150.code_for_rate(21), 6)
+    test.assert_eq(bmm150.code_for_rate(25), 6)
+    test.assert_eq(bmm150.code_for_rate(26), 7)
+    test.assert_eq(bmm150.code_for_rate(999), 7)
+
+@test
+fn test_the_rate_is_written_leaving_the_mode_and_read_only_in_normal_mode() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    // Sleep mode measures nothing.
+    test.assert_eq(bmm150.rate_read(d), 0)
+    test.assert_eq(bmm150.rate_write(d, 20), 20)
+    test.assert_eq(reg_of(c, 0x4C), 0x2E)
+    test.assert_eq(bmm150.rate_read(d), 0)
+    c.regs.insert(0x4C, 0x28)
+    test.assert_eq(bmm150.rate_read(d), 20)
+    test.assert_eq(bmm150.rate_write(d, 100), 30)
+    test.assert_eq(reg_of(c, 0x4C), 0x38)
+    test.assert_eq(bmm150.rate_read(d), 30)
+    c.regs.insert(0x4C, 0x0A)
+    test.assert_eq(bmm150.rate_read(d), 0)
+    c.ro.insert(0x4C, 1)
+    test.assert_eq(bmm150.rate_write(d, 30), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(bmm150.rate_read(d), 0)
+    test.assert_eq(bmm150.rate_write(d, 2), 0)
+
+// ── Repetitions and presets ──────────────────────────────────────────
+
+@test
+fn test_the_repetitions_follow_the_data_sheet_s_formulas() [io, hw, mutate]
+    test.assert_eq(bmm150.rep_xy_of(0), 1)
+    test.assert_eq(bmm150.rep_xy_of(1), 3)
+    test.assert_eq(bmm150.rep_xy_of(255), 511)
+    test.assert_eq(bmm150.rep_z_of(0), 1)
+    test.assert_eq(bmm150.rep_z_of(1), 2)
+    test.assert_eq(bmm150.rep_z_of(255), 256)
+
+@test
+fn test_the_forced_time_is_the_data_sheet_s_sum() [io, hw, mutate]
+    // 145 us for each XY repetition, 500 us for each Z repetition, and 980 us.
+    test.assert_eq(bmm150.forced_time_us(9, 15), 9785)
+    test.assert_eq(bmm150.forced_time_us(3, 3), 2915)
+    test.assert_eq(bmm150.forced_time_us(47, 83), 49295)
+
+@test
+fn test_the_repetitions_are_written_as_registers_and_held_to_their_range() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(bmm150.rep_write(d, 9, 15))
+    test.assert_eq(reg_of(c, 0x51), 4)
+    test.assert_eq(reg_of(c, 0x52), 14)
+    test.assert_eq(bmm150.rep_xy_read(d), 9)
+    test.assert_eq(bmm150.rep_z_read(d), 15)
+    test.assert(bmm150.rep_write(d, 9999, 9999))
+    test.assert_eq(reg_of(c, 0x51), 255)
+    test.assert_eq(reg_of(c, 0x52), 255)
+    test.assert(bmm150.rep_write(d, 0, 0))
+    test.assert_eq(reg_of(c, 0x51), 0)
+    test.assert_eq(reg_of(c, 0x52), 0)
+    c.ro.insert(0x52, 1)
+    test.assert(not bmm150.rep_write(d, 9, 15))
+    c.st.insert(4, 0)
+    test.assert_eq(bmm150.rep_xy_read(d), 0)
+    test.assert_eq(bmm150.rep_z_read(d), 0)
+
+@test
+fn test_the_presets_are_the_data_sheet_s_table() [io, hw, mutate]
+    test.assert_eq(bmm150.preset_xy(BmmPreset.BmmLowPower), 3)
+    test.assert_eq(bmm150.preset_xy(BmmPreset.BmmRegular), 9)
+    test.assert_eq(bmm150.preset_xy(BmmPreset.BmmEnhanced), 15)
+    test.assert_eq(bmm150.preset_xy(BmmPreset.BmmHighAccuracy), 47)
+    test.assert_eq(bmm150.preset_z(BmmPreset.BmmLowPower), 3)
+    test.assert_eq(bmm150.preset_z(BmmPreset.BmmRegular), 15)
+    test.assert_eq(bmm150.preset_z(BmmPreset.BmmEnhanced), 27)
+    test.assert_eq(bmm150.preset_z(BmmPreset.BmmHighAccuracy), 83)
+    test.assert_eq(bmm150.preset_hz(BmmPreset.BmmLowPower), 10)
+    test.assert_eq(bmm150.preset_hz(BmmPreset.BmmRegular), 10)
+    test.assert_eq(bmm150.preset_hz(BmmPreset.BmmEnhanced), 10)
+    test.assert_eq(bmm150.preset_hz(BmmPreset.BmmHighAccuracy), 20)
+
+@test
+fn test_a_preset_writes_the_repetitions_and_the_rate() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(bmm150.preset_write(d, BmmPreset.BmmHighAccuracy))
+    // REPXY (47 - 1) / 2 = 23, REPZ 83 - 1 = 82, 20 Hz is code 5.
+    writes_are(c, [0x51, 23, 0x52, 82, 0x4C, 0x2E])
+    test.assert(bmm150.preset_write(d, BmmPreset.BmmLowPower))
+    writes_are(c, [0x51, 1, 0x52, 2, 0x4C, 0x06])
+    c.ro.insert(0x4C, 1)
+    test.assert(not bmm150.preset_write(d, BmmPreset.BmmHighAccuracy))
+
+// ── Forced measurement ───────────────────────────────────────────────
+
+@test
+fn test_a_forced_measurement_loads_the_trim_data_then_polls_the_flag_then_reads() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    put_raw(c, 100, -60, 200, 8000, 0)
+    // It takes three reads of RHALL's LSB.
+    c.st.insert(50, 3)
+    let a = bmm150.measure_forced(d)
+    test.assert_eq(x_of(a), 33375)
+    test.assert_eq(y_of(a), -18500)
+    test.assert_eq(z_of(a), 45062)
+    // The measurement ended by itself and the field reads sleep.
+    test.assert_eq(reg_of(c, 0x4C) & 0x06, 0x06)
+
+@test
+fn test_a_forced_measurement_that_never_finishes_gives_nothing() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.st.insert(50, 99999999)
+    test.assert(is_none(bmm150.measure_forced(d)))
+    let c2 = chip_on()
+    c2.st.insert(4, 0)
+    test.assert(is_none(bmm150.measure_forced(i2c_dut(c2))))
+    // The trim data loaded, the forced start refused.
+    let c3 = chip_on()
+    c3.ro.insert(0x4C, 1)
+    c3.st.insert(70, 4)
+    test.assert(is_none(bmm150.measure_forced(i2c_dut(c3))))
+
+// ── Waiting on a host's scheduler ────────────────────────────────────
+
+// A timer that records each sleep (`st[100]` their number, `st[101]` the last
+// length in microseconds, `st[102]` the first): each sleep also lets a forced
+// measurement run to its end, as time does.
+struct FakeTimer
+    c: Chip
+
+impl TimerAsync for FakeTimer
+    @tier(app)
+    async fn sleep_ms(self, ms: Int) [hw]
+        self.c.st.insert(100, at(self.c.st, 100) + 1)
+        self.c.st.insert(101, ms * 1000)
+
+    @tier(app)
+    async fn sleep_us(self, us: Int) [hw]
+        if at(self.c.st, 100) == 0
+            self.c.st.insert(102, us)
+        self.c.st.insert(100, at(self.c.st, 100) + 1)
+        self.c.st.insert(101, us)
+
+@test
+fn test_an_awaited_measurement_parks_for_the_time_the_repetitions_need_then_reads() [io, hw, async, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x51, 4)
+    c.regs.insert(0x52, 14)
+    put_raw(c, 100, -60, 200, 8000, 0)
+    let a = await bmm150.mag_measure(d, FakeTimer { c: c })
+    // 9 repetitions on X and Y, 15 on Z: 9 785 us; the data was there at once.
+    test.assert_eq(at(c.st, 100), 1)
+    test.assert_eq(at(c.st, 102), 9785)
+    test.assert_eq(x_of(a), 33375)
+
+@test
+fn test_an_awaited_measurement_that_is_slow_parks_again_and_gives_up_after_four() [io, hw, async, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x51, 4)
+    c.regs.insert(0x52, 14)
+    put_raw(c, 100, -60, 200, 8000, 0)
+    c.st.insert(50, 2)
+    let a = await bmm150.mag_measure(d, FakeTimer { c: c })
+    test.assert_eq(at(c.st, 100), 3)
+    test.assert_eq(at(c.st, 101), 1000)
+    test.assert_eq(x_of(a), 33375)
+    let c2 = chip_on()
+    c2.regs.insert(0x51, 4)
+    c2.regs.insert(0x52, 14)
+    c2.st.insert(50, 99999999)
+    test.assert(is_none(await bmm150.mag_measure(i2c_dut(c2), FakeTimer { c: c2 })))
+    test.assert_eq(at(c2.st, 100), 5)
+
+@test
+fn test_an_awaited_measurement_stops_where_the_part_does_not_answer() [io, hw, async, mutate]
+    let c = chip_on()
+    c.st.insert(4, 0)
+    test.assert(is_none(await bmm150.mag_measure(i2c_dut(c), FakeTimer { c: c })))
+    test.assert_eq(at(c.st, 100), 0)
+    // The trim data loaded, the repetitions unreadable.
+    let c2 = chip_on()
+    c2.st.insert(70, 3)
+    test.assert(is_none(await bmm150.mag_measure(i2c_dut(c2), FakeTimer { c: c2 })))
+    // The repetitions read, the forced start refused.
+    let c3 = chip_on()
+    c3.regs.insert(0x51, 4)
+    c3.regs.insert(0x52, 14)
+    c3.ro.insert(0x4C, 1)
+    c3.st.insert(70, 6)
+    test.assert(is_none(await bmm150.mag_measure(i2c_dut(c3), FakeTimer { c: c3 })))
+    test.assert_eq(at(c3.st, 100), 0)
+
+@test
+fn test_an_awaited_sample_parks_until_the_flag_is_set() [io, hw, async, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    put_raw(c, 100, -60, 200, 8000, 1)
+    // Two reads of the flag answer not ready.
+    c.st.insert(53, 2)
+    let a = await bmm150.mag_next(d, FakeTimer { c: c }, 5000, 5)
+    test.assert_eq(at(c.st, 100), 2)
+    test.assert_eq(at(c.st, 101), 5000)
+    test.assert_eq(x_of(a), 33375)
+
+@test
+fn test_an_awaited_sample_that_never_comes_gives_nothing() [io, hw, async, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(is_none(await bmm150.mag_next(d, FakeTimer { c: c }, 1000, 3)))
+    test.assert_eq(at(c.st, 100), 3)
+
+// The data-ready pin as a board that edges are armed on delivers it: `st[110]`
+// is the pin armed, `st[111]` the edge, and a refusal is set with `st[112]`.
+struct FakeEdge
+    c: Chip
+
+impl AsyncEdge[hw] for FakeEdge
+    @tier(app)
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int [hw]
+        if at(self.c.st, 112) != 0
+            return -2
+        self.c.st.insert(110, pin)
+        self.c.st.insert(111, edge)
+        0
+
+    @tier(app)
+    fn edge_disarm(self, pin: Int) -> Bool [hw]
+        pin == at(self.c.st, 110)
+
+    @tier(app)
+    fn edge_irqs(self) -> Int [hw]
+        0
+
+@test
+fn test_the_ready_pin_is_armed_on_a_rising_edge_through_the_board() [io, hw, mutate]
+    let c = chip_on()
+    let f = core.rt.future_new()
+    test.assert_eq(bmm150.irq_arm(FakeEdge { c: c }, i2c_wiring(), f), 0)
+    test.assert_eq(at(c.st, 110), 65)
+    test.assert_eq(at(c.st, 111), 0)
+    test.assert(bmm150.irq_disarm(FakeEdge { c: c }, i2c_wiring()))
+    c.st.insert(112, 1)
+    test.assert_eq(bmm150.irq_arm(FakeEdge { c: c }, i2c_wiring(), f), -2)
+    let bare = dev_bus.wiring_i2c(0, 0x10)
+    test.assert_eq(bmm150.irq_arm(FakeEdge { c: c }, bare, f), -1)
+    test.assert(not bmm150.irq_disarm(FakeEdge { c: c }, bare))
+    core.rt.future_drop(f)
+
+// ── Axes, pins and interrupts ────────────────────────────────────────
+
+@test
+fn test_the_axes_are_enabled_by_clearing_their_bits() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4E, 0x87)
+    test.assert(bmm150.axes_write(d, true, true, true))
+    test.assert_eq(reg_of(c, 0x4E), 0x87)
+    test.assert(bmm150.axes_write(d, false, true, true))
+    test.assert_eq(reg_of(c, 0x4E), 0x8F)
+    test.assert(bmm150.axes_write(d, true, false, true))
+    test.assert_eq(reg_of(c, 0x4E), 0x97)
+    test.assert(bmm150.axes_write(d, true, true, false))
+    test.assert_eq(reg_of(c, 0x4E), 0xA7)
+    test.assert(bmm150.axes_write(d, false, false, false))
+    test.assert_eq(reg_of(c, 0x4E), 0xBF)
+
+@test
+fn test_the_ready_pin_and_the_interrupt_pin_are_set_in_their_own_bits() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4E, 0x00)
+    test.assert(bmm150.drdy_pin_write(d, true, true))
+    test.assert_eq(reg_of(c, 0x4E), 0x84)
+    test.assert(bmm150.drdy_pin_write(d, true, false))
+    test.assert_eq(reg_of(c, 0x4E), 0x80)
+    test.assert(bmm150.drdy_pin_write(d, false, false))
+    test.assert_eq(reg_of(c, 0x4E), 0x00)
+    test.assert(bmm150.int_pin_write(d, true, true, true))
+    test.assert_eq(reg_of(c, 0x4E), 0x43)
+    test.assert(bmm150.int_pin_write(d, true, false, false))
+    test.assert_eq(reg_of(c, 0x4E), 0x40)
+    test.assert(bmm150.int_pin_write(d, false, false, false))
+    test.assert_eq(reg_of(c, 0x4E), 0x00)
+
+@test
+fn test_the_thresholds_and_the_enables_are_written_whole() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(bmm150.thresholds_write(d, 12, 200))
+    test.assert_eq(reg_of(c, 0x4F), 12)
+    test.assert_eq(reg_of(c, 0x50), 200)
+    test.assert(bmm150.int_enable_write(d, 0xF8))
+    test.assert_eq(reg_of(c, 0x4D), 0xF8)
+    c.regs.insert(0x4A, 0x41)
+    test.assert_eq(bmm150.int_status(d), 0x41)
+    c.ro.insert(0x50, 1)
+    test.assert(not bmm150.thresholds_write(d, 1, 2))
+    c.st.insert(4, 0)
+    test.assert_eq(bmm150.int_status(d), 0)
+
+// ── Self-test ────────────────────────────────────────────────────────
+
+@test
+fn test_the_normal_self_test_puts_the_part_to_sleep_sets_the_bit_and_reads_the_axes() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x4C, 0x28)
+    c.st.insert(61, 7)
+    c.st.insert(60, 3)
+    test.assert_eq(bmm150.self_test_normal(d), 7)
+    test.assert(bmm150.self_test_passed(7))
+    // Sleep first, then the self-test bit, written without a read-back.
+    writes_are(c, [0x4C, 0x2E, 0x4C, 0x2F])
+    c.regs.insert(0x42, 0)
+    c.regs.insert(0x44, 0)
+    c.regs.insert(0x46, 0)
+    c.st.insert(61, 5)
+    test.assert_eq(bmm150.self_test_normal(d), 5)
+    test.assert(not bmm150.self_test_passed(5))
+    c.regs.insert(0x42, 0)
+    c.regs.insert(0x44, 0)
+    c.regs.insert(0x46, 0)
+    c.st.insert(61, 2)
+    test.assert_eq(bmm150.self_test_normal(d), 2)
+
+@test
+fn test_a_self_test_that_never_finishes_or_a_silent_part_gives_minus_one() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.st.insert(60, -1)
+    test.assert_eq(bmm150.self_test_normal(d), -1)
+    let c2 = chip_on()
+    c2.st.insert(4, 0)
+    test.assert_eq(bmm150.self_test_normal(i2c_dut(c2)), -1)
+    // Sleep taken, then the part is gone before the OPMODE read.
+    let c3 = chip_on()
+    c3.st.insert(70, 2)
+    test.assert_eq(bmm150.self_test_normal(i2c_dut(c3)), -1)
+    // The self-test bit refused.
+    let c4 = chip_on()
+    c4.st.insert(70, 4)
+    test.assert_eq(bmm150.self_test_normal(i2c_dut(c4)), -1)
+    // The part ends the wait and then fails to give the results.
+    let c5 = chip_on()
+    c5.st.insert(70, 5)
+    test.assert_eq(bmm150.self_test_normal(i2c_dut(c5)), -1)
+    // The wait ends and the part is gone before the results are read.
+    let c6 = chip_on()
+    c6.st.insert(70, 6)
+    test.assert_eq(bmm150.self_test_normal(i2c_dut(c6)), -1)
+    // The part gives the mode and then no answer to the read of OPMODE.
+    let c7 = chip_on()
+    c7.st.insert(70, 3)
+    test.assert_eq(bmm150.self_test_normal(i2c_dut(c7)), -1)
+
+// ── Power and bring-up ───────────────────────────────────────────────
+
+@test
+fn test_the_power_bit_is_set_and_cleared_and_clearing_it_forgets_the_trim_data() [io, hw, mutate]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(bmm150.power_on(d))
+    test.assert_eq(reg_of(c, 0x4B), 1)
+    test.assert(bmm150.trim_load(d))
+    test.assert(bmm150.trim_ready())
+    c.regs.insert(0x51, 4)
+    test.assert(bmm150.suspend(d))
+    test.assert_eq(reg_of(c, 0x4B), 0)
+    test.assert(not bmm150.trim_ready())
+    // Suspend loses the registers but POWER.
+    test.assert_eq(reg_of(c, 0x51), 0)
+    c.st.insert(4, 0)
+    test.assert(not bmm150.power_on(d))
+
+@test
+fn test_a_soft_reset_sets_both_bits_and_polls_until_they_clear() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.regs.insert(0x51, 4)
+    c.st.insert(44, 3)
+    test.assert(bmm150.soft_reset(d))
+    writes_are(c, [0x4B, 0x83])
+    test.assert_eq(reg_of(c, 0x4B), 1)
+    test.assert_eq(reg_of(c, 0x51), 0)
+    test.assert_eq(reg_of(c, 0x4C), 0x06)
+
+@test
+fn test_a_soft_reset_is_ignored_in_suspend_so_the_bits_never_set() [io, hw, mutate]
+    let c = chip()
+    let d = i2c_dut(c)
+    // With the power control bit clear nothing is reset; the poll sees the bits
+    // clear at once, which is why `start` sets the power bit first.
+    c.regs.insert(0x4B, 0x00)
+    c.regs.insert(0x51, 4)
+    c.st.insert(70, 0)
+    test.assert(bmm150.soft_reset(d))
+    test.assert_eq(reg_of(c, 0x51), 0)
+
+@test
+fn test_a_soft_reset_that_never_clears_or_a_silent_part_fails() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    c.st.insert(44, -1)
+    test.assert(not bmm150.soft_reset(d))
+    let c2 = chip_on()
+    c2.st.insert(4, 0)
+    test.assert(not bmm150.soft_reset(i2c_dut(c2)))
+    let c3 = chip_on()
+    c3.st.insert(70, 1)
+    test.assert(not bmm150.soft_reset(i2c_dut(c3)))
+    let c4 = chip_on()
+    c4.st.insert(70, 2)
+    test.assert(not bmm150.soft_reset(i2c_dut(c4)))
+
+@test
+fn test_the_bring_up_powers_the_part_resets_it_cycles_the_power_and_sets_the_regular_preset() [io, hw, mutate]
+    let c = chip()
+    let d = i2c_dut(c)
+    // The part answers its chip id only after 5 reads of start-up time, and its
+    // reset bits clear after 2 reads.
+    c.st.insert(41, 5)
+    c.st.insert(44, 2)
+    test.assert(bmm150.start(d))
+    // Power on; the soft reset; suspend; power on; the regular preset (REPXY 4,
+    // REPZ 14, 10 Hz in sleep); the data-ready pin; normal mode.
+    writes_are(c, [0x4B,
+        0x01,
+        0x4B,
+        0x83,
+        0x4B,
+        0x00,
+        0x4B,
+        0x01,
+        0x51,
+        0x04,
+        0x52,
+        0x0E,
+        0x4C,
+        0x06,
+        0x4E,
+        0x87,
+        0x4C,
+        0x00])
+    test.assert(bmm150.trim_ready())
+    test.assert_eq(bmm150.trim_get().xyz1, 7500)
+    test.assert_eq(reg_of(c, 0x4C), 0x00)
+    test.assert(bmm150.mode_read(d) == BmmMode.BmmNormal)
+    test.assert_eq(bmm150.rate_read(d), 10)
+    test.assert_eq(at(c.st, 22), 400000)
+
+@test
+fn test_the_bring_up_over_spi_runs_the_same_settings() [io, hw, mutate]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(bmm150.start(d))
+    writes_are(c, [0x4B,
+        0x01,
+        0x4B,
+        0x83,
+        0x4B,
+        0x00,
+        0x4B,
+        0x01,
+        0x51,
+        0x04,
+        0x52,
+        0x0E,
+        0x4C,
+        0x06,
+        0x4E,
+        0x87,
+        0x4C,
+        0x00])
+
+@test
+fn test_a_part_that_never_answers_its_chip_id_or_is_not_a_bmm150_is_refused() [io, hw, mutate]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x40, 0x33)
+    test.assert(not bmm150.start(d))
+    // It was powered, and nothing else was written.
+    writes_are(c, [0x4B, 0x01])
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(not bmm150.start(i2c_dut(c2)))
+    test.assert(not bmm150.start(spi_dut(c2)))
+
+@test
+fn test_a_wiring_the_bus_cannot_use_is_refused_before_anything_is_sent() [io, hw, mutate]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not bmm150.start(I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: w }))
+    log_is(c, [])
+
+@test
+fn test_each_step_of_the_bring_up_that_fails_ends_it() [io, hw, mutate]
+    // The part goes silent after n transactions, for each n up to the end of
+    // the trim read; the start never reports success.
+    let c1 = chip()
+    c1.st.insert(70, 1)
+    test.assert(not bmm150.start(i2c_dut(c1)))
+    let c2 = chip()
+    c2.ro.insert(0x4B, 1)
+    test.assert(not bmm150.start(i2c_dut(c2)))
+    let c3 = chip()
+    c3.st.insert(44, -1)
+    test.assert(not bmm150.start(i2c_dut(c3)))
+    // The chip id does not read 0x32 within the polls the driver makes.
+    let c4 = chip()
+    c4.st.insert(41, 5000)
+    test.assert(not bmm150.start(i2c_dut(c4)))
+    // A start-up of a few reads after each power-up is waited out.
+    let c5 = chip()
+    c5.st.insert(41, 40)
+    test.assert(bmm150.start(i2c_dut(c5)))
+    test.assert_eq(bmm150.trim_get().xyz1, 7500)
+
+@test
+fn test_a_part_that_dies_in_the_middle_of_the_bring_up_ends_it() [io, hw, mutate]
+    // One transaction at a time: the part answers n and then goes silent.  A
+    // complete bring-up is `total` transactions.
+    let whole = chip()
+    test.assert(bmm150.start(i2c_dut(whole)))
+    let total = transactions(whole)
+    for n in 1..total
+        let c = chip()
+        c.st.insert(70, n)
+        test.assert(not bmm150.start(i2c_dut(c)))
+    let last = chip()
+    last.st.insert(70, total)
+    test.assert(bmm150.start(i2c_dut(last)))
+
+@test
+fn test_a_part_that_refuses_the_preset_or_the_last_settings_fails_the_bring_up() [io, hw, mutate]
+    let c = chip()
+    c.ro.insert(0x51, 1)
+    test.assert(not bmm150.start(i2c_dut(c)))
+    let c2 = chip()
+    c2.ro.insert(0x4E, 1)
+    test.assert(not bmm150.start(i2c_dut(c2)))
+    let c3 = chip()
+    c3.ro.insert(0x4C, 1)
+    test.assert(not bmm150.start(i2c_dut(c3)))
+
+// ── The two types ────────────────────────────────────────────────────
+//
+// The types are built over the host's board handles, which answer as absent
+// hardware here: each method answers its "no part" value.  This runs the lines
+// of the two types that forward to the functions above.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw, mutate]
+    bmm150.trim_clear()
+    let w = dev_bus.wiring_i2c(0, 0x10)
+    let p = Bmm150.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x40) == None)
+    test.assert(not p.set_reg(0x51, 1))
+    test.assert(p.mode() == BmmMode.BmmSleep)
+    test.assert(not p.set_mode(BmmMode.BmmNormal))
+    test.assert_eq(p.set_rate_hz(10), 0)
+    test.assert(not p.set_preset(BmmPreset.BmmRegular))
+    test.assert(is_none(p.measure()))
+    test.assert_eq(p.self_test(), -1)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(is_none(p.mag_read()))
+    test.assert(not p.mag_ready())
+    test.assert_eq(p.mag_rate_hz(), 0)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw, mutate]
+    bmm150.trim_clear()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let p = Bmm150Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x40) == None)
+    test.assert(not p.set_reg(0x51, 1))
+    test.assert(p.mode() == BmmMode.BmmSleep)
+    test.assert(not p.set_mode(BmmMode.BmmNormal))
+    test.assert_eq(p.set_rate_hz(10), 0)
+    test.assert(not p.set_preset(BmmPreset.BmmRegular))
+    test.assert(is_none(p.measure()))
+    test.assert_eq(p.self_test(), -1)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(is_none(p.mag_read()))
+    test.assert(not p.mag_ready())
+    test.assert_eq(p.mag_rate_hz(), 0)
+    test.assert(p.device_id() == None)

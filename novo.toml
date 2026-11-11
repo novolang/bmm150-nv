@@ -1,0 +1,28 @@
+[package]
+name        = "bmm150-nv"
+version     = "0.1.0"
+description = "A driver for Bosch's BMM150 three-axis geomagnetic sensor on an I2C or an SPI bus: the magnetic field in nanotesla from the raw values, the RHALL resistance and the factory trim data with the SensorAPI's integer compensation, the normal, forced and sleep modes, the data rates, the four repetition presets, the data-ready pin, the threshold interrupts as configuration, the normal self-test and the chip id, as devices-nv's Magnetometer and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["bmm150", "bosch", "magnetometer", "compass", "i2c", "spi", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/bmm150-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# The package is checked at the embedded tier, the strictest one, so
+# every function in it is also valid at rt and system.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Reading a BMM150 magnetometer from a device program"
+
+[dependencies]
+# The board's I2C bus, SPI bus, GPIO and timer handles, and the I2cBus,
+# SpiBus, GpioOut, TimerAsync and AsyncEdge traits.
+embedded-hal-nv = "^0.3.3"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the Magnetometer and Identifiable traits.
+devices-nv      = "^0.3.3"
