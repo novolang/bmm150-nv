@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-11-12
 
-The package takes devices-nv and embedded-hal-nv by path until 0.4.0 is published.
+The release depends on devices-nv 0.4.0 and embedded-hal-nv 0.4.0.
 
 - `Magnetometer.mag_start()` starts one forced measurement and answers its time in
   microseconds, from the repetitions the part is set to; -1 when the part does not
