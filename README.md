@@ -177,6 +177,8 @@ board's device table builds it.  Both implement `Magnetometer` and `Identifiable
 | `begin()` | brings the part up, see below |
 | `mag_read()`, `mag_ready()`, `mag_read_new()` | `Magnetometer`: the latest sample in nanotesla, the data-ready flag, a sample not read before |
 | `mag_rate_hz()` | the rate in normal mode; 0 in forced and sleep mode |
+| `mag_start()` | `Magnetometer`: starts one forced measurement and answers its time in microseconds from the repetitions the part is set to (-1 when the part does not answer); the part returns to sleep mode afterwards |
+| `mag_status()` | `Magnetometer`: `MagOverflow` when INT STATUS's overflow flag is set, `MagValid` otherwise, `MagNotReady` when the part does not answer; reading it does not clear the ready flag |
 | `device_id()` | `Identifiable`: CHIP_ID, 0x32, which a part in suspend mode does not answer |
 | `mode()`, `set_mode(m)` | normal, forced or sleep; forced starts one measurement |
 | `set_rate_hz(hz)`, `set_preset(p)` | the slowest rate at or above `hz`, and the repetitions and rate of a preset |
@@ -227,7 +229,8 @@ through any `AsyncEdge` source, after `drdy_pin_write`.  No board's GPIO impleme
    `sample_read` loads it when it is missing, and `suspend` forgets it, since the
    part loses its registers.
 3. A reading is in nanotesla with 62.5 nT of resolution, which is the 1/16
-   microtesla that the formula carries.  An axis that the compensation cannot
+   microtesla that the formula carries.  `mag_status()` reads the part's own overflow
+   flag, so a program need not look for the value below.  An axis that the compensation cannot
    compute reads `OVERFLOW_NT`, -32 768 000 nanotesla, which is the SensorAPI's
    -32768 microtesla: the ADC's overflow marker (-4096 on X and Y, -16384 on Z), a
    zero in the trim data or in the resistance, or a zero divisor.  `is_overflow`
@@ -256,6 +259,17 @@ The data sheet gives the Z repetitions as `nZ = 1 + REPZ` (Table 26) and the pre
 does X and Y, `(n - 1) / 2`: about half.  The driver follows the data sheet.  Which is
 right for the silicon is NOT VERIFIED; the effect is the noise and the time of a
 measurement, not its correctness.
+
+## Where the traits fall short
+
+- `mag_range` keeps the trait's body (`None`): the part's range is fixed per axis, ±1300
+  microtesla on X and Y and ±2500 on Z, and is not one of the gauss ranges `MagRange` names.
+- The trim data is module state, because a trait method takes a plain `self` that holds
+  no state, so `Magnetometer` is implemented with `[hw, mutate]` and so is every caller.
+- `MagnetometerAsync` cannot be implemented by a `@value` driver (SPEC section 14.5) and
+  the embedded tier refuses `async fn`, so `mag_measure` and `mag_next` stay free
+  `@tier(rt)` functions over a `TimerAsync`.
+- No board's GPIO implements `AsyncEdge`, so `irq_arm` and `irq_disarm` have no source.
 
 ## What is not included
 

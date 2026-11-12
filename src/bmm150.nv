@@ -86,7 +86,7 @@
 
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, TimerAsync, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_mag.{ MagNanoT, Magnetometer }
+use dev_mag.{ MagNanoT, MagStatus, Magnetometer }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
@@ -129,6 +129,8 @@ let PINS_LATCH    = 0x02
 let PINS_INT_POL  = 0x01
 // RHALL's LSB register: the data-ready flag.
 let DRDY = 0x01
+// INT STATUS: the overflow flag.
+let INT_OVERFLOW = 0x40
 
 // The ADC's overflow markers, and the value that stands for them.
 let XY_OVERFLOW_ADC = -4096
@@ -654,6 +656,10 @@ pub fn measure_forced<P: Bmm150Port>(p: P) -> ?MagNanoT [hw, mutate]
 // implemented by `Bmm150`.  A program at `@tier(embedded)` arms the data-ready
 // pin through `irq_arm` and the board's `AsyncEdge` instead.
 
+// Stays an inherent function: planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5,
+// row "the async forms" (a `@value` driver cannot implement `MagnetometerAsync`,
+// and the embedded tier refuses `async fn`).
+//
 // Starts one forced measurement, parks the task for the time the repetitions
 // need, and answers the sample.  The part measures in the background while
 // the task is parked.  If the data is not there when the time has passed the
@@ -688,6 +694,9 @@ async fn mag_next<P: Bmm150Port, T: TimerAsync>(p: P, t: T, period_us: Int,
         await t.sleep_us(period_us)
     None
 
+// Stays an inherent function: planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5,
+// row "the async forms" (no board's GPIO implements `AsyncEdge`).
+//
 // Arms the part's data-ready pin on a rising edge through a board's pin-edge
 // source: 0 when armed, a negative value when refused, and -1 for a wiring
 // with no pin.  The edge resolves `f`.  The DRDY pin must be enabled by
@@ -744,6 +753,37 @@ pub fn int_enable_write<P: Bmm150Port>(p: P, bits: Int) -> Bool [hw]
 // threshold flags.  Zero when the part did not answer.
 pub fn int_status<P: Bmm150Port>(p: P) -> Int [hw]
     reg_read(p, INT_STATUS) ?? 0
+
+// What INT STATUS says of the sample, in the trait's terms: `MagOverflow` when
+// the overflow flag (bit 6) is set, `MagValid` otherwise.  The flag is the
+// part's own, so a program need not read `OVERFLOW_NT` in a value as one.  The
+// overrun flag (bit 7) means a sample was lost before the next one, not that
+// this one is bad.
+pub fn status_of(int_status: Int) -> MagStatus
+    if (int_status & INT_OVERFLOW) != 0
+        return MagStatus.MagOverflow
+    MagStatus.MagValid
+
+// INT STATUS read on its own, in the trait's terms.  Reading it clears none of
+// the data flags, unlike RHALL's DRDY.  A part that did not answer has no
+// completed sample, so `MagNotReady`.
+pub fn mag_status_read<P: Bmm150Port>(p: P) -> MagStatus [hw]
+    match reg_read(p, INT_STATUS)
+        Some(v) => status_of(v)
+        None    => MagStatus.MagNotReady
+
+// Starts one forced measurement and answers how long it takes in microseconds,
+// from the repetitions the part is set to (`forced_time_us`): -1 when the part
+// did not answer.  The part measures in the background and returns to sleep
+// mode, so a program reads the sample once the time has passed.
+pub fn mag_start_us<P: Bmm150Port>(p: P) -> Int [hw]
+    if not forced_start(p)
+        return -1
+    let nxy = rep_xy_read(p)
+    let nz = rep_z_read(p)
+    if nxy == 0 or nz == 0
+        return -1
+    forced_time_us(nxy, nz)
 
 // ── Self-test ────────────────────────────────────────────────────────
 
@@ -902,6 +942,11 @@ impl Bmm150
         self_test_normal(self)
 
 impl Magnetometer[hw, mutate] for Bmm150
+    // Plain `self` holds no state, so the trim data is module state and the
+    // effect is [hw, mutate]: planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5, row
+    // "Magnetometer".  `mag_range` keeps the trait's body (`None`): the part's
+    // range is fixed per axis (±1300 uT on X and Y, ±2500 uT on Z), not one of
+    // the gauss ranges `MagRange` names.
     fn mag_read(self) -> ?MagNanoT [hw, mutate]
         sample_read(self)
 
@@ -910,6 +955,12 @@ impl Magnetometer[hw, mutate] for Bmm150
 
     fn mag_rate_hz(self) -> Int [hw, mutate]
         rate_read(self)
+
+    fn mag_start(self) -> Int [hw, mutate]
+        mag_start_us(self)
+
+    fn mag_status(self) -> MagStatus [hw, mutate]
+        mag_status_read(self)
 
 impl Identifiable[hw] for Bmm150
     // CHIP_ID, 0x32; the part keeps no revision register, so `rev` is `None`.
@@ -982,6 +1033,11 @@ impl Bmm150Spi
         self_test_normal(self)
 
 impl Magnetometer[hw, mutate] for Bmm150Spi
+    // Plain `self` holds no state, so the trim data is module state and the
+    // effect is [hw, mutate]: planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5, row
+    // "Magnetometer".  `mag_range` keeps the trait's body (`None`): the part's
+    // range is fixed per axis (±1300 uT on X and Y, ±2500 uT on Z), not one of
+    // the gauss ranges `MagRange` names.
     fn mag_read(self) -> ?MagNanoT [hw, mutate]
         sample_read(self)
 
@@ -990,6 +1046,12 @@ impl Magnetometer[hw, mutate] for Bmm150Spi
 
     fn mag_rate_hz(self) -> Int [hw, mutate]
         rate_read(self)
+
+    fn mag_start(self) -> Int [hw, mutate]
+        mag_start_us(self)
+
+    fn mag_status(self) -> MagStatus [hw, mutate]
+        mag_status_read(self)
 
 impl Identifiable[hw] for Bmm150Spi
     // CHIP_ID, 0x32; the part keeps no revision register, so `rev` is `None`.

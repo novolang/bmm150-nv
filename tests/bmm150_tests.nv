@@ -16,7 +16,7 @@
 use std.test
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, TimerAsync, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_mag.{ MagNanoT, Magnetometer }
+use dev_mag.{ MagNanoT, MagStatus, Magnetometer }
 use dev_id.{ DeviceId, Identifiable }
 use bmm150
 use bmm150.{ Bmm150, Bmm150Spi, BmmMode, BmmPreset, Bmm150Port, Bmm150Trim }
@@ -1278,6 +1278,62 @@ fn test_the_thresholds_and_the_enables_are_written_whole() [io, hw, mutate]
     c.st.insert(4, 0)
     test.assert_eq(bmm150.int_status(d), 0)
 
+// ── The trait's status and start ─────────────────────────────────────
+
+@test
+fn test_the_status_is_overflow_when_the_part_s_flag_is_set_and_valid_otherwise() [io, hw, mutate]
+    test.assert(bmm150.status_of(0x00) == MagStatus.MagValid)
+    test.assert(bmm150.status_of(0x40) == MagStatus.MagOverflow)
+    test.assert(bmm150.status_of(0x41) == MagStatus.MagOverflow)
+    // The overrun flag and the threshold flags are not an overflow.
+    test.assert(bmm150.status_of(0xBF) == MagStatus.MagValid)
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert(bmm150.mag_status_read(d) == MagStatus.MagValid)
+    log_is(c, [2, 0x10, 0x4A, 1, -1])
+    c.regs.insert(0x4A, 0x40)
+    test.assert(bmm150.mag_status_read(d) == MagStatus.MagOverflow)
+    // A part that does not answer has no completed sample.
+    c.st.insert(4, 0)
+    test.assert(bmm150.mag_status_read(d) == MagStatus.MagNotReady)
+
+@test
+fn test_reading_the_status_does_not_clear_the_ready_flag() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    put_raw(c, 100, -60, 200, 8000, 1)
+    test.assert(bmm150.mag_status_read(d) == MagStatus.MagValid)
+    test.assert(bmm150.sample_ready(d))
+
+@test
+fn test_a_start_writes_forced_mode_and_answers_the_time_the_repetitions_need() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    // The regular repetitions on a part left at 1 and 1: 145 + 500 + 980 us.
+    test.assert_eq(bmm150.mag_start_us(d), 1625)
+    writes_are(c, [0x4C, 0x02])
+    // The high-accuracy preset, 47 on X and Y and 83 on Z: about 49 ms.
+    test.assert(bmm150.rep_write(d, 47, 83))
+    c.st.insert(80, 0)
+    test.assert_eq(bmm150.mag_start_us(d), 49295)
+    writes_are(c, [0x4C, 0x02])
+    test.assert_eq(bmm150.forced_time_us(47, 83), 49295)
+
+@test
+fn test_a_start_that_the_part_does_not_answer_is_refused() [io, hw, mutate]
+    let c = chip_on()
+    c.st.insert(4, 0)
+    test.assert_eq(bmm150.mag_start_us(i2c_dut(c)), -1)
+    // The part answers the mode and takes the write, then goes silent before
+    // the repetitions are read.
+    let c2 = chip_on()
+    c2.st.insert(70, 2)
+    test.assert_eq(bmm150.mag_start_us(i2c_dut(c2)), -1)
+    // And after the first repetition register.
+    let c3 = chip_on()
+    c3.st.insert(70, 3)
+    test.assert_eq(bmm150.mag_start_us(i2c_dut(c3)), -1)
+
 // ── Self-test ────────────────────────────────────────────────────────
 
 @test
@@ -1546,6 +1602,10 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw, mutate]
     test.assert(is_none(p.mag_read()))
     test.assert(not p.mag_ready())
     test.assert_eq(p.mag_rate_hz(), 0)
+    test.assert_eq(p.mag_start(), -1)
+    test.assert(p.mag_status() == MagStatus.MagNotReady)
+    test.assert(p.mag_range() == None)
+    test.assert(not p.mag_set_range(dev_mag.MagRange.MagRange4G))
     test.assert(p.device_id() == None)
 
 @test
@@ -1566,4 +1626,8 @@ fn test_the_spi_type_over_absent_hardware() [io, hw, mutate]
     test.assert(is_none(p.mag_read()))
     test.assert(not p.mag_ready())
     test.assert_eq(p.mag_rate_hz(), 0)
+    test.assert_eq(p.mag_start(), -1)
+    test.assert(p.mag_status() == MagStatus.MagNotReady)
+    test.assert(p.mag_range() == None)
+    test.assert(not p.mag_set_range(dev_mag.MagRange.MagRange4G))
     test.assert(p.device_id() == None)

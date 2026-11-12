@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+The package takes devices-nv and embedded-hal-nv by path until 0.4.0 is published.
+
+- `Magnetometer.mag_start()` starts one forced measurement and answers its time in
+  microseconds, from the repetitions the part is set to; -1 when the part does not
+  answer.  The module function is `mag_start_us`.
+- `Magnetometer.mag_status()` reads INT STATUS's overflow flag: `MagOverflow` when it is
+  set, `MagValid` otherwise, `MagNotReady` when the part does not answer.  The sample
+  still carries `OVERFLOW_NT` for an axis the compensation cannot compute.  The module
+  functions are `mag_status_read` and `status_of`.
+- `mag_range` and `mag_set_range` keep the trait's bodies: the range is fixed per axis.
+
 ## 0.1.0
 
 The first release: a driver for Bosch Sensortec's BMM150 three-axis geomagnetic
