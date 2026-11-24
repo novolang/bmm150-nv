@@ -15,7 +15,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, TimerAsync, AsyncEdge }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_mag.{ MagNanoT, MagStatus, Magnetometer }
 use dev_id.{ DeviceId, Identifiable }
 use bmm150
@@ -359,11 +359,7 @@ struct I2cDut
     pins: FakePins
     w: DeviceWiring
 
-impl Bmm150Port for I2cDut
-    @tier(app)
-    fn setup(self) -> Bool [hw]
-        bmm150.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for I2cDut
     @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         bmm150.i2c_read_into(self.bus, self.w, reg, n, var dst)
@@ -371,6 +367,11 @@ impl Bmm150Port for I2cDut
     @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         bmm150.i2c_write(self.bus, self.w, reg, v)
+
+impl Bmm150Port for I2cDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        bmm150.i2c_setup(self.bus, self.pins, self.w)
 
     @tier(app)
     fn irq_level(self) -> Int [hw]
@@ -381,11 +382,7 @@ struct SpiDut
     pins: FakePins
     w: DeviceWiring
 
-impl Bmm150Port for SpiDut
-    @tier(app)
-    fn setup(self) -> Bool [hw]
-        bmm150.spi_setup(self.bus, self.pins, self.w)
-
+impl RegPort for SpiDut
     @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         bmm150.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
@@ -393,6 +390,11 @@ impl Bmm150Port for SpiDut
     @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         bmm150.spi_write(self.bus, self.pins, self.w, reg, v)
+
+impl Bmm150Port for SpiDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        bmm150.spi_setup(self.bus, self.pins, self.w)
 
     @tier(app)
     fn irq_level(self) -> Int [hw]
@@ -517,7 +519,7 @@ fn trims() -> Bmm150Trim
 fn test_an_i2c_read_of_one_register_sends_the_bare_register() [io, hw, mutate]
     let c = chip_on()
     let d = i2c_dut(c)
-    test.assert_eq(bmm150.reg_read(d, 0x40) ?? -1, 0x32)
+    test.assert_eq(d.read_reg(0x40) ?? -1, 0x32)
     log_is(c, [2, 0x10, 0x40, 1, -1])
 
 @test
@@ -545,30 +547,30 @@ fn test_an_update_changes_only_the_bits_of_its_mask() [io, hw, mutate]
     let c = chip_on()
     let d = i2c_dut(c)
     c.regs.insert(0x51, 0xAA)
-    test.assert(bmm150.reg_update(d, 0x51, 0x0F, 0xFF))
+    test.assert(d.update_reg_verified(0x51, 0x0F, 0xFF))
     test.assert_eq(reg_of(c, 0x51), 0xAF)
-    test.assert(bmm150.reg_update(d, 0x51, 0xF0, 0x00))
+    test.assert(d.update_reg_verified(0x51, 0xF0, 0x00))
     test.assert_eq(reg_of(c, 0x51), 0x0F)
     c.ro.insert(0x51, 1)
-    test.assert(not bmm150.reg_update(d, 0x51, 0xF0, 0xF0))
+    test.assert(not d.update_reg_verified(0x51, 0xF0, 0xF0))
     c.st.insert(4, 0)
-    test.assert(not bmm150.reg_update(d, 0x51, 0xF0, 0xF0))
+    test.assert(not d.update_reg_verified(0x51, 0xF0, 0xF0))
 
 @test
 fn test_a_missing_i2c_part_does_not_answer() [io, hw, mutate]
     let c = chip_on()
     c.st.insert(4, 0)
     let d = i2c_dut(c)
-    test.assert(bmm150.reg_read(d, 0x40) == None)
+    test.assert(d.read_reg(0x40) == None)
     test.assert(not d.write_reg(0x51, 4))
-    test.assert(not bmm150.reg_write(d, 0x51, 4))
+    test.assert(not d.write_reg_verified(0x51, 4))
     test.assert(bmm150.id_read(d) == None)
 
 @test
 fn test_an_spi_read_sets_rw_and_a_run_just_keeps_clocking() [io, hw, mutate]
     let c = chip_on()
     let d = spi_dut(c)
-    test.assert_eq(bmm150.reg_read(d, 0x40) ?? -1, 0x32)
+    test.assert_eq(d.read_reg(0x40) ?? -1, 0x32)
     log_is(c, [3, 0xC0, 0xFF, -1])
     test.assert_eq(at(d.pins.levels, 67), 1)
     c.regs.insert(0x42, 11)
@@ -594,7 +596,7 @@ fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw, mutat
     let c = chip_on()
     c.st.insert(4, 0)
     let d = spi_dut(c)
-    test.assert_eq(bmm150.reg_read(d, 0x40) ?? -1, 0xFF)
+    test.assert_eq(d.read_reg(0x40) ?? -1, 0xFF)
     test.assert(bmm150.id_read(d) == None)
 
 @test
@@ -1631,3 +1633,13 @@ fn test_the_spi_type_over_absent_hardware() [io, hw, mutate]
     test.assert(p.mag_range() == None)
     test.assert(not p.mag_set_range(dev_mag.MagRange.MagRange4G))
     test.assert(p.device_id() == None)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw, mutate]
+    let c = chip_on()
+    let d = i2c_dut(c)
+    test.assert_eq(bmm150.reg_read(d, 0x40), d.read_reg(0x40))
+    test.assert_eq(bmm150.reg_write(d, 0x40, 0x01), d.write_reg_verified(0x40, 0x01))
+    test.assert_eq(bmm150.reg_update(d, 0x40, 0x0F, 0x01), d.update_reg_verified(0x40, 0x0F, 0x01))

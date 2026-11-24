@@ -163,7 +163,7 @@ The part has two bus interfaces on the same pins, chosen by the PS pin.
 
 | Module | What is in it |
 |---|---|
-| `bmm150` | The types `Bmm150` (I2C) and `Bmm150Spi` (SPI), `BmmMode`, `BmmPreset`, `Bmm150Trim`, the trait `Bmm150Port`, the bus framing, the register access, the trim data and the compensation, the modes, the presets, the forced measurement, the self-test, the awaiting functions and the bring-up |
+| `bmm150` | The types `Bmm150` (I2C) and `Bmm150Spi` (SPI), `BmmMode`, `BmmPreset`, `Bmm150Trim`, the trait `Bmm150Port` over devices-nv's `RegPort`, the bus framing, the register access, the trim data and the compensation, the modes, the presets, the forced measurement, the self-test, the awaiting functions and the bring-up |
 
 ## How to choose an entry point
 
@@ -197,8 +197,7 @@ trim data and the raw values, so a program that reads the part itself can use
 them.  `trim_load(part)` reads the 11 trim values, `trim_get()` answers them and
 `trim_clear()` forgets them.
 
-A program that holds its own bus, or a test with a double of the part, implements
-`Bmm150Port` over its bus and calls the module's functions, which take the port:
+A program that holds its own bus, or a test with a double of the part, implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Bmm150Port` over its bus and calls the module's functions, which take the port:
 `bmm150.sample_read(port)`, `bmm150.start(port)`.  The framing of each bus is
 `i2c_read_into`, `i2c_write`, `spi_read_into` and `spi_write`, generic over `I2cBus`
 and `SpiBus`.

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.0 — 2026-11-24
+
+The register reads and writes, and the bus set-up, are devices-nv's `RegPort` and `wiring_*` functions, and `Bmm150Port` is smaller by them.  The release depends on devices-nv 0.4.1.
+
+### Breaking
+
+- **`Bmm150Port` has the supertrait `RegPort` and no longer declares `read_regs` and `write_reg`.**  A type that implements `Bmm150Port` for a bus of its own moves those two methods, unchanged, into an `impl RegPort`.  *Migration:* with `use dev_bus.{ RegPort }`,
+
+  ```novo
+  impl RegPort for MyPort
+      fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+          ...
+      fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+          ...
+
+  impl Bmm150Port for MyPort
+      ...                      // the other methods stay where they are
+  ```
+
+  The package's own types are migrated.  A caller that holds one of them is unaffected.
+
+### Deprecated
+
+- `i2c_setup`, `spi_setup`, `irq_level_of`, `reg_read`, `reg_write`, `reg_update`: each is a one-line function over the method or the `wiring_*` function that replaces it, warns W1001 at a call with the replacement named, and is removed in the next release.  `Bmm150Port` itself is the driver's trait and stays.
+
+### Changed
+
+- The register helpers the module carried (`reg_read`, `reg_write`, `reg_update` over its port) are devices-nv's `RegPort` methods (`read_reg`, `write_reg_verified`, `update_reg_verified` and the others); the module calls them as `p.read_reg(reg)`.
+- The bus set-up and the interrupt-level read are devices-nv's `wiring_i2c_setup`, `wiring_spi_setup` and `wiring_irq_level`, called with the part's rate and mode.
+- Image size on nrf52840-dk, `.text` plus read-only data, before and after: 19,828 bytes before and 19,764 after on the read-out (nrf52-qemu: 7,952 and 7,952).
+
 ## 0.1.1 — 2026-11-12
 
 The release depends on devices-nv 0.4.0 and embedded-hal-nv 0.4.0.
